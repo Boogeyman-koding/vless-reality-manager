@@ -5,7 +5,7 @@
 set -o pipefail
 
 APP_NAME="VLESS REALITY Manager v1"
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 GITHUB_VERSION_URL="https://raw.githubusercontent.com/Boogeyman-koding/vless-reality-manager/main/version.txt"
 GITHUB_SCRIPT_URL="https://raw.githubusercontent.com/Boogeyman-koding/vless-reality-manager/main/vless-reality-manager-v1.sh"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
