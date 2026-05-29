@@ -5,6 +5,9 @@
 set -o pipefail
 
 APP_NAME="VLESS REALITY Manager v1"
+SCRIPT_VERSION="1.1.0"
+GITHUB_VERSION_URL="https://raw.githubusercontent.com/Boogeyman-koding/vless-reality-manager/main/version.txt"
+GITHUB_SCRIPT_URL="https://raw.githubusercontent.com/Boogeyman-koding/vless-reality-manager/main/vless-reality-manager-v1.sh"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
 XRAY_DIR="/usr/local/etc/xray"
 MANAGER_CONFIG="/etc/vless-reality-manager.conf"
@@ -679,6 +682,7 @@ show_config() {
 
     echo "Настройки:"
     echo
+    echo "SCRIPT_VERSION=${SCRIPT_VERSION}"
     echo "SERVER_IP=${SERVER_IP:-не задано}"
     echo "XRAY_PORT=${XRAY_PORT:-не задано}"
     echo "REALITY_SNI=${REALITY_SNI:-не задано}"
@@ -725,6 +729,139 @@ update_sni_dest() {
     pause
 }
 
+
+version_to_number() {
+    local version="$1"
+    local major minor patch
+    IFS='.' read -r major minor patch <<< "$version"
+    major="${major:-0}"
+    minor="${minor:-0}"
+    patch="${patch:-0}"
+    printf "%03d%03d%03d" "$major" "$minor" "$patch"
+}
+
+update_script_from_github() {
+    clear
+    echo "Проверка обновления скрипта"
+    echo
+
+    local remote_version
+    local current_num
+    local remote_num
+    local current_script
+    local tmp_script
+    local backup_script
+
+    remote_version="$(curl -fsSL "$GITHUB_VERSION_URL" | tr -d '[:space:]' || true)"
+
+    if [[ -z "$remote_version" ]]; then
+        err "Не удалось получить version.txt с GitHub."
+        echo "Проверь ссылку:"
+        echo "$GITHUB_VERSION_URL"
+        pause
+        return 1
+    fi
+
+    echo "Текущая версия:   $SCRIPT_VERSION"
+    echo "Версия на GitHub: $remote_version"
+    echo
+
+    current_num="$(version_to_number "$SCRIPT_VERSION")"
+    remote_num="$(version_to_number "$remote_version")"
+
+    if (( 10#$remote_num <= 10#$current_num )); then
+        ok "Обновление не требуется."
+        pause
+        return 0
+    fi
+
+    read -r -p "Доступна новая версия. Обновить скрипт? [Y/n]: " confirm
+    confirm="${confirm:-y}"
+
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        warn "Обновление отменено."
+        pause
+        return 0
+    fi
+
+    current_script="$(readlink -f "$0")"
+    tmp_script="/tmp/vless-reality-manager-update.sh"
+    backup_script="${current_script}.bak"
+
+    if ! curl -fsSL "$GITHUB_SCRIPT_URL" -o "$tmp_script"; then
+        err "Не удалось скачать новый скрипт с GitHub."
+        echo "Проверь ссылку:"
+        echo "$GITHUB_SCRIPT_URL"
+        pause
+        return 1
+    fi
+
+    if ! head -n 1 "$tmp_script" | grep -q "bash"; then
+        err "Скачанный файл не похож на bash-скрипт. Обновление остановлено."
+        rm -f "$tmp_script"
+        pause
+        return 1
+    fi
+
+    cp "$current_script" "$backup_script"
+    mv "$tmp_script" "$current_script"
+    chmod +x "$current_script"
+
+    ok "Скрипт обновлён."
+    ok "Резервная копия: $backup_script"
+    echo
+    echo "Перезапускаю новую версию..."
+    sleep 1
+    exec "$current_script"
+}
+
+delete_all_users() {
+    clear
+
+    if [[ ! -f "$USERS_FILE" ]]; then
+        err "Файл пользователей не найден: $USERS_FILE"
+        pause
+        return 1
+    fi
+
+    local count
+    count="$(jq 'length' "$USERS_FILE" 2>/dev/null || echo 0)"
+
+    echo "Удаление всех пользователей"
+    echo
+    echo "Сейчас пользователей: $count"
+    echo
+
+    if [[ "$count" -eq 0 ]]; then
+        warn "Удалять нечего."
+        pause
+        return 0
+    fi
+
+    warn "Это действие удалит ВСЕ ключи/ссылки пользователей из Xray."
+    warn "Старые ссылки перестанут работать."
+    echo
+    read -r -p "Для подтверждения напиши DELETE: " confirm
+
+    if [[ "$confirm" != "DELETE" ]]; then
+        warn "Отменено."
+        pause
+        return 0
+    fi
+
+    cp "$USERS_FILE" "${USERS_FILE}.bak.$(date +%Y%m%d-%H%M%S)"
+    echo "[]" > "$USERS_FILE"
+    chmod 644 "$USERS_FILE"
+
+    sync_users_to_xray
+    test_xray_config
+    restart_xray
+
+    ok "Все пользователи удалены."
+    ok "Резервная копия users.json сохранена рядом с исходным файлом."
+    pause
+}
+
 main_menu() {
     while true; do
         clear
@@ -741,6 +878,8 @@ main_menu() {
         echo "8) Показать настройки"
         echo "9) Изменить SNI/Dest"
         echo "10) Статус Xray"
+        echo "11) Обновить скрипт с GitHub"
+        echo "12) Удалить всех пользователей"
         echo "0) Выход"
         echo
         read -r -p "Выбор: " choice
@@ -756,6 +895,8 @@ main_menu() {
             8) show_config ;;
             9) update_sni_dest ;;
             10) show_status ;;
+            11) update_script_from_github ;;
+            12) delete_all_users ;;
             0) exit 0 ;;
             *) err "Неверный выбор"; sleep 1 ;;
         esac
