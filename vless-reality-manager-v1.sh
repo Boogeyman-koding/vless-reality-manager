@@ -5,7 +5,7 @@
 set -o pipefail
 
 APP_NAME="VLESS REALITY Manager v1"
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 GITHUB_VERSION_URL="https://raw.githubusercontent.com/Boogeyman-koding/vless-reality-manager/main/version.txt"
 GITHUB_SCRIPT_URL="https://raw.githubusercontent.com/Boogeyman-koding/vless-reality-manager/main/vless-reality-manager-v1.sh"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
@@ -14,6 +14,11 @@ MANAGER_CONFIG="/etc/vless-reality-manager.conf"
 USERS_FILE="/usr/local/etc/xray/users.json"
 KEYS_FILE="/usr/local/etc/xray/reality.keys"
 BACKUP_ROOT="/root/vless-backups"
+XRAY_ACCESS_LOG="/var/log/xray/access.log"
+XRAY_ERROR_LOG="/var/log/xray/error.log"
+NOTIFY_SCRIPT="/usr/local/bin/vless-reality-notify"
+NOTIFY_SERVICE="/etc/systemd/system/vless-reality-notify.service"
+NOTIFY_STATE_DIR="/var/lib/vless-reality-manager"
 
 DEFAULT_PORT="443"
 DEFAULT_SNI="github.com"
@@ -54,6 +59,7 @@ load_manager_config() {
     REALITY_FP="${REALITY_FP:-$DEFAULT_FP}"
     BOT_TOKEN="${BOT_TOKEN:-}"
     CHAT_ID="${CHAT_ID:-}"
+    TELEGRAM_NOTIFY="${TELEGRAM_NOTIFY:-off}"
 }
 
 save_manager_config() {
@@ -65,6 +71,7 @@ REALITY_DEST="${REALITY_DEST:-$DEFAULT_DEST}"
 REALITY_FP="${REALITY_FP:-$DEFAULT_FP}"
 BOT_TOKEN="${BOT_TOKEN:-}"
 CHAT_ID="${CHAT_ID:-}"
+TELEGRAM_NOTIFY="${TELEGRAM_NOTIFY:-off}"
 EOF
     chmod 600 "$MANAGER_CONFIG"
 }
@@ -114,6 +121,7 @@ install_xray_core() {
 
 ensure_files() {
     mkdir -p "$XRAY_DIR"
+    mkdir -p /var/log/xray "$NOTIFY_STATE_DIR"
 
     if [[ ! -f "$USERS_FILE" ]]; then
         echo "[]" > "$USERS_FILE"
@@ -170,6 +178,8 @@ create_xray_config() {
     cat > "$XRAY_CONFIG" <<EOF
 {
   "log": {
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log",
     "loglevel": "warning"
   },
   "routing": {
@@ -260,6 +270,10 @@ fix_xray_permissions() {
     chmod 644 /usr/local/etc/xray/config.json 2>/dev/null || true
     chmod 644 /usr/local/etc/xray/users.json 2>/dev/null || true
     chmod 644 /usr/local/etc/xray/reality.keys 2>/dev/null || true
+    mkdir -p /var/log/xray "$NOTIFY_STATE_DIR" 2>/dev/null || true
+    touch "$XRAY_ACCESS_LOG" "$XRAY_ERROR_LOG" 2>/dev/null || true
+    chmod 755 /var/log/xray "$NOTIFY_STATE_DIR" 2>/dev/null || true
+    chmod 644 "$XRAY_ACCESS_LOG" "$XRAY_ERROR_LOG" 2>/dev/null || true
 }
 
 restart_xray() {
@@ -457,6 +471,9 @@ create_user_with_name() {
 
 ${link}"
     send_qr_to_telegram "$link" "$email"
+    telegram_notify "🆕 Пользователь создан через менеджер
+
+Имя: ${email}"
 }
 
 create_user() {
@@ -651,6 +668,9 @@ delete_user() {
     restart_xray
 
     ok "Пользователь удалён: $email"
+    telegram_notify "🗑 Пользователь удалён через менеджер
+
+Имя: ${email}"
     pause
 }
 
@@ -697,6 +717,7 @@ show_config() {
         echo "BOT_TOKEN=не задан"
     fi
     echo "CHAT_ID=${CHAT_ID:-не задано}"
+    echo "TELEGRAM_NOTIFY=${TELEGRAM_NOTIFY:-off}"
 
     pause
 }
@@ -990,6 +1011,229 @@ delete_all_users() {
     pause
 }
 
+
+telegram_notify() {
+    local text="$1"
+
+    load_manager_config
+
+    if [[ "${TELEGRAM_NOTIFY:-off}" != "on" ]]; then
+        return 0
+    fi
+
+    if [[ -z "${BOT_TOKEN:-}" || -z "${CHAT_ID:-}" ]]; then
+        return 0
+    fi
+
+    text="$(printf '%s' "$text" | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null || printf '%s' "$text")"
+
+    curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        -d "chat_id=${CHAT_ID}" \
+        --data-urlencode "text=${text}" >/dev/null 2>&1 || true
+}
+
+install_notify_service() {
+    cat > "$NOTIFY_SCRIPT" <<'EOF_NOTIFY'
+#!/usr/bin/env bash
+
+CONFIG_FILE="/etc/vless-reality-manager.conf"
+ACCESS_LOG="/var/log/xray/access.log"
+STATE_DIR="/var/lib/vless-reality-manager"
+SEEN_FILE="${STATE_DIR}/notify_seen.log"
+
+mkdir -p "$STATE_DIR"
+touch "$SEEN_FILE"
+touch "$ACCESS_LOG"
+
+send_tg() {
+    local text="$1"
+
+    if [[ -f "$CONFIG_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$CONFIG_FILE"
+    fi
+
+    if [[ "${TELEGRAM_NOTIFY:-off}" != "on" ]]; then
+        return 0
+    fi
+
+    if [[ -z "${BOT_TOKEN:-}" || -z "${CHAT_ID:-}" ]]; then
+        return 0
+    fi
+
+    text="$(printf '%s' "$text" | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null || printf '%s' "$text")"
+
+    curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        -d "chat_id=${CHAT_ID}" \
+        --data-urlencode "text=${text}" >/dev/null 2>&1 || true
+}
+
+parse_and_notify() {
+    local line="$1"
+    local user ip key now
+
+    user="$(echo "$line" | sed -n 's/.*email: \([^ ]*\).*/\1/p' | head -n1)"
+    [[ -z "$user" ]] && user="$(echo "$line" | grep -oE 'email: [^ ]+' | awk '{print $2}' | head -n1)"
+    [[ -z "$user" ]] && user="unknown"
+
+    ip="$(echo "$line" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)"
+    [[ -z "$ip" ]] && ip="unknown"
+
+    now="$(date +%Y%m%d%H)"
+    key="${now}|${user}|${ip}"
+
+    if grep -qxF "$key" "$SEEN_FILE" 2>/dev/null; then
+        return 0
+    fi
+
+    echo "$key" >> "$SEEN_FILE"
+    tail -n 500 "$SEEN_FILE" > "${SEEN_FILE}.tmp" && mv "${SEEN_FILE}.tmp" "$SEEN_FILE"
+
+    send_tg "🔵 Активность VLESS REALITY
+
+Пользователь: ${user}
+IP: ${ip}
+Время: $(date '+%Y-%m-%d %H:%M:%S')"
+}
+
+tail -n 0 -F "$ACCESS_LOG" | while read -r line; do
+    echo "$line" | grep -qiE 'accepted|email:' || continue
+    parse_and_notify "$line"
+done
+EOF_NOTIFY
+
+    chmod +x "$NOTIFY_SCRIPT"
+
+    cat > "$NOTIFY_SERVICE" <<EOF_SERVICE
+[Unit]
+Description=VLESS Reality Telegram Notifications
+After=network.target xray.service
+Wants=xray.service
+
+[Service]
+Type=simple
+ExecStart=${NOTIFY_SCRIPT}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
+
+    systemctl daemon-reload
+}
+
+enable_telegram_notifications() {
+    clear
+    echo "Включение Telegram-уведомлений"
+    echo
+
+    load_manager_config
+
+    if [[ -z "${BOT_TOKEN:-}" || -z "${CHAT_ID:-}" ]]; then
+        warn "Сначала настрой Telegram в пункте меню 7."
+        pause
+        return 1
+    fi
+
+    TELEGRAM_NOTIFY="on"
+    save_manager_config
+    install_notify_service
+
+    systemctl enable --now vless-reality-notify.service
+
+    ok "Telegram-уведомления включены."
+    telegram_notify "✅ Telegram-уведомления VLESS REALITY включены."
+    pause
+}
+
+disable_telegram_notifications() {
+    clear
+
+    load_manager_config
+    TELEGRAM_NOTIFY="off"
+    save_manager_config
+
+    systemctl disable --now vless-reality-notify.service >/dev/null 2>&1 || true
+
+    ok "Telegram-уведомления выключены."
+    pause
+}
+
+show_notify_status() {
+    clear
+    echo "Статус Telegram-уведомлений"
+    echo
+
+    load_manager_config
+    echo "TELEGRAM_NOTIFY=${TELEGRAM_NOTIFY:-off}"
+    echo
+
+    systemctl status vless-reality-notify.service --no-pager 2>/dev/null || true
+    pause
+}
+
+show_online_users() {
+    clear
+    echo "Активные пользователи по access.log"
+    echo
+
+    if [[ ! -f "$XRAY_ACCESS_LOG" ]]; then
+        warn "Лог доступа ещё не создан: $XRAY_ACCESS_LOG"
+        echo "Попробуй подключиться одним клиентом и зайти на сайт."
+        pause
+        return 0
+    fi
+
+    echo "Показываются последние активности из access.log."
+    echo "Это не идеальный real-time online, но хорошо показывает, кто недавно пользовался VPN."
+    echo
+
+    local tmp
+    tmp="$(mktemp)"
+
+    tail -n 2000 "$XRAY_ACCESS_LOG" | while read -r line; do
+        local user ip
+        user="$(echo "$line" | sed -n 's/.*email: \([^ ]*\).*/\1/p' | head -n1)"
+        [[ -z "$user" ]] && user="unknown"
+        ip="$(echo "$line" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1)"
+        [[ -z "$ip" ]] && ip="-"
+        if echo "$line" | grep -qiE 'accepted|email:'; then
+            echo "${user}|${ip}|${line}"
+        fi
+    done > "$tmp"
+
+    if [[ ! -s "$tmp" ]]; then
+        warn "Активности пока не найдено."
+        echo
+        echo "После обновления подключись одним ключом и открой сайт."
+        rm -f "$tmp"
+        pause
+        return 0
+    fi
+
+    awk -F'|' '
+    {
+        key=$1 "|" $2
+        last[key]=$3
+        user[key]=$1
+        ip[key]=$2
+    }
+    END {
+        i=0
+        for (k in last) {
+            i++
+            print i ") " user[k]
+            print "IP: " ip[k]
+            print "Последняя активность: " last[k]
+            print ""
+        }
+    }' "$tmp"
+
+    rm -f "$tmp"
+    pause
+}
+
 main_menu() {
     while true; do
         clear
@@ -1011,6 +1255,10 @@ main_menu() {
         echo "13) Создать резервную копию"
         echo "14) Показать резервные копии"
         echo "15) Восстановить резервную копию"
+        echo "16) Активные пользователи"
+        echo "17) Включить Telegram-уведомления"
+        echo "18) Выключить Telegram-уведомления"
+        echo "19) Статус Telegram-уведомлений"
         echo "0) Выход"
         echo
         read -r -p "Выбор: " choice
@@ -1031,6 +1279,10 @@ main_menu() {
             13) create_manual_backup ;;
             14) list_backups ;;
             15) restore_backup ;;
+            16) show_online_users ;;
+            17) enable_telegram_notifications ;;
+            18) disable_telegram_notifications ;;
+            19) show_notify_status ;;
             0) exit 0 ;;
             *) err "Неверный выбор"; sleep 1 ;;
         esac
