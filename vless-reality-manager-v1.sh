@@ -5,7 +5,7 @@
 set -o pipefail
 
 APP_NAME="VLESS REALITY Manager v1"
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.2.0"
 GITHUB_VERSION_URL="https://raw.githubusercontent.com/Boogeyman-koding/vless-reality-manager/main/version.txt"
 GITHUB_SCRIPT_URL="https://raw.githubusercontent.com/Boogeyman-koding/vless-reality-manager/main/vless-reality-manager-v1.sh"
 XRAY_CONFIG="/usr/local/etc/xray/config.json"
@@ -13,6 +13,7 @@ XRAY_DIR="/usr/local/etc/xray"
 MANAGER_CONFIG="/etc/vless-reality-manager.conf"
 USERS_FILE="/usr/local/etc/xray/users.json"
 KEYS_FILE="/usr/local/etc/xray/reality.keys"
+BACKUP_ROOT="/root/vless-backups"
 
 DEFAULT_PORT="443"
 DEFAULT_SNI="github.com"
@@ -730,6 +731,128 @@ update_sni_dest() {
 }
 
 
+
+create_backup() {
+    local reason="${1:-manual}"
+    local timestamp
+    local backup_dir
+
+    timestamp="$(date +%Y%m%d-%H%M%S)"
+    backup_dir="${BACKUP_ROOT}/${timestamp}-${reason}"
+
+    mkdir -p "$backup_dir"
+
+    cp "$USERS_FILE" "$backup_dir/users.json" 2>/dev/null || true
+    cp "$XRAY_CONFIG" "$backup_dir/config.json" 2>/dev/null || true
+    cp "$KEYS_FILE" "$backup_dir/reality.keys" 2>/dev/null || true
+    cp "$MANAGER_CONFIG" "$backup_dir/vless-reality-manager.conf" 2>/dev/null || true
+
+    chmod -R 700 "$backup_dir" 2>/dev/null || true
+
+    echo "$backup_dir"
+}
+
+create_manual_backup() {
+    clear
+    echo "Создание резервной копии"
+    echo
+
+    local backup_dir
+    backup_dir="$(create_backup "manual")"
+
+    ok "Резервная копия создана:"
+    echo "$backup_dir"
+    pause
+}
+
+list_backups() {
+    clear
+    echo "Резервные копии"
+    echo
+
+    if [[ ! -d "$BACKUP_ROOT" ]]; then
+        warn "Папка с резервными копиями ещё не создана."
+        pause
+        return 0
+    fi
+
+    local backups
+    mapfile -t backups < <(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d | sort -r)
+
+    if [[ "${#backups[@]}" -eq 0 ]]; then
+        warn "Резервных копий пока нет."
+        pause
+        return 0
+    fi
+
+    for i in "${!backups[@]}"; do
+        echo "$((i + 1))) ${backups[$i]}"
+    done
+
+    pause
+}
+
+restore_backup() {
+    clear
+    echo "Восстановление из резервной копии"
+    echo
+
+    if [[ ! -d "$BACKUP_ROOT" ]]; then
+        err "Папка с резервными копиями не найдена: $BACKUP_ROOT"
+        pause
+        return 1
+    fi
+
+    local backups
+    mapfile -t backups < <(find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d | sort -r)
+
+    if [[ "${#backups[@]}" -eq 0 ]]; then
+        warn "Резервных копий пока нет."
+        pause
+        return 0
+    fi
+
+    for i in "${!backups[@]}"; do
+        echo "$((i + 1))) ${backups[$i]}"
+    done
+
+    echo
+    read -r -p "Выбери номер резервной копии: " choice
+
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#backups[@]} )); then
+        err "Неверный номер."
+        pause
+        return 1
+    fi
+
+    local selected="${backups[$((choice - 1))]}"
+
+    echo
+    warn "Будут восстановлены users.json, config.json, reality.keys и конфиг менеджера, если они есть в бэкапе."
+    read -r -p "Для подтверждения напиши RESTORE: " confirm
+
+    if [[ "$confirm" != "RESTORE" ]]; then
+        warn "Отменено."
+        pause
+        return 0
+    fi
+
+    create_backup "before-restore" >/dev/null
+
+    cp "$selected/users.json" "$USERS_FILE" 2>/dev/null || true
+    cp "$selected/config.json" "$XRAY_CONFIG" 2>/dev/null || true
+    cp "$selected/reality.keys" "$KEYS_FILE" 2>/dev/null || true
+    cp "$selected/vless-reality-manager.conf" "$MANAGER_CONFIG" 2>/dev/null || true
+
+    fix_xray_permissions
+    test_xray_config
+    restart_xray
+
+    ok "Восстановление завершено."
+    ok "Xray перезапущен."
+    pause
+}
+
 version_to_number() {
     local version="$1"
     local major minor patch
@@ -787,6 +910,11 @@ update_script_from_github() {
     current_script="$(readlink -f "$0")"
     tmp_script="/tmp/vless-reality-manager-update.sh"
     backup_script="${current_script}.bak"
+
+    backup_dir="$(create_backup "before-script-update")"
+    ok "Создана резервная копия данных:"
+    echo "$backup_dir"
+    echo
 
     if ! curl -fsSL "$GITHUB_SCRIPT_URL" -o "$tmp_script"; then
         err "Не удалось скачать новый скрипт с GitHub."
@@ -849,7 +977,7 @@ delete_all_users() {
         return 0
     fi
 
-    cp "$USERS_FILE" "${USERS_FILE}.bak.$(date +%Y%m%d-%H%M%S)"
+    create_backup "before-delete-all-users" >/dev/null
     echo "[]" > "$USERS_FILE"
     chmod 644 "$USERS_FILE"
 
@@ -880,6 +1008,9 @@ main_menu() {
         echo "10) Статус Xray"
         echo "11) Обновить скрипт с GitHub"
         echo "12) Удалить всех пользователей"
+        echo "13) Создать резервную копию"
+        echo "14) Показать резервные копии"
+        echo "15) Восстановить резервную копию"
         echo "0) Выход"
         echo
         read -r -p "Выбор: " choice
@@ -897,6 +1028,9 @@ main_menu() {
             10) show_status ;;
             11) update_script_from_github ;;
             12) delete_all_users ;;
+            13) create_manual_backup ;;
+            14) list_backups ;;
+            15) restore_backup ;;
             0) exit 0 ;;
             *) err "Неверный выбор"; sleep 1 ;;
         esac
